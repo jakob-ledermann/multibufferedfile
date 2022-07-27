@@ -2,6 +2,7 @@ use std::{
     cmp::Ordering,
     fs::OpenOptions,
     io::{Read, Seek, SeekFrom, Write},
+    mem::ManuallyDrop,
     path::{Path, PathBuf},
 };
 
@@ -103,7 +104,7 @@ impl std::io::Seek for BufferedFileReader {
 
 pub struct BufferedFileWriter {
     inner: std::fs::File,
-    digest: Digest<'static, u32>,
+    digest: ManuallyDrop<Digest<'static, u32>>,
 }
 
 impl std::io::Write for BufferedFileWriter {
@@ -118,11 +119,15 @@ impl std::io::Write for BufferedFileWriter {
     }
 }
 
-impl BufferedFileWriter {
-    pub fn close(mut self) -> std::io::Result<()> {
-        let checksum = self.digest.finalize();
-        self.inner.write_all(&checksum.to_le_bytes())?;
-        Ok(())
+impl BufferedFileWriter {}
+
+impl Drop for BufferedFileWriter {
+    fn drop(&mut self) {
+        // SAFETY: this is the only instance where the digest is removed so it is still valid.
+        // this is drop so it can't be called more than once.
+        let digest = unsafe { ManuallyDrop::take(&mut self.digest) };
+        let checksum = digest.finalize();
+        self.inner.write_all(&checksum.to_le_bytes());
     }
 }
 

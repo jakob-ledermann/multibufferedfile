@@ -2,11 +2,10 @@ use std::{
     cmp::Ordering,
     fs::OpenOptions,
     io::{Read, Seek, SeekFrom, Write},
-    mem::ManuallyDrop,
     path::{Path, PathBuf},
 };
 
-use crc::{Crc, Digest, CRC_32_ISCSI};
+use crc::{Crc, CRC_32_ISCSI};
 use thiserror::Error;
 
 const BUFFER_COUNT: u8 = 2;
@@ -73,34 +72,9 @@ fn check_file(file: &Path) -> std::io::Result<FileCheckResult> {
     }
 }
 
-pub struct BufferedFileReader {
-    inner: std::fs::File,
-    useful_file_size: u64,
-}
+pub use reader::*;
 
-impl std::io::Read for BufferedFileReader {
-    fn read(&mut self, mut buf: &mut [u8]) -> std::io::Result<usize> {
-        let limit =
-            usize::try_from(self.useful_file_size - self.inner.stream_position()?).unwrap_or(0);
-        if buf.len() > limit {
-            buf = &mut buf[..limit]
-        }
-        self.inner.read(buf)
-    }
-}
-
-impl std::io::Seek for BufferedFileReader {
-    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
-        let inner_pos = match pos {
-            SeekFrom::Start(start) => SeekFrom::Start(start.saturating_add(1)),
-            SeekFrom::Current(delta) => SeekFrom::Current(delta),
-            SeekFrom::End(distance) => SeekFrom::End(distance.saturating_add(4)),
-        };
-
-        let new_start = self.inner.seek(inner_pos)?.saturating_sub(1);
-        Ok(new_start)
-    }
-}
+mod reader;
 
 pub use writer::*;
 
@@ -112,14 +86,11 @@ impl BufferedFile {
         Self::select_file(files.into_iter())
     }
 
-    pub fn read(self) -> Result<BufferedFileReader, BufferedFileErrors> {
+    pub fn read(self) -> Result<BufferedFileReader<std::fs::File>, BufferedFileErrors> {
         let mut file = OpenOptions::new().read(true).open(self.file)?;
         file.seek(SeekFrom::Start(1))?;
         let usable_file_size = file.metadata()?.len().saturating_sub(4);
-        Ok(BufferedFileReader {
-            inner: file,
-            useful_file_size: usable_file_size,
-        })
+        Ok(BufferedFileReader::new(file, usable_file_size))
     }
 
     pub fn write(self) -> Result<BufferedFileWriter<std::fs::File>, BufferedFileErrors> {

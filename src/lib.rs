@@ -102,34 +102,9 @@ impl std::io::Seek for BufferedFileReader {
     }
 }
 
-pub struct BufferedFileWriter {
-    inner: std::fs::File,
-    digest: ManuallyDrop<Digest<'static, u32>>,
-}
+pub use writer::*;
 
-impl std::io::Write for BufferedFileWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let count = self.inner.write(buf)?;
-        self.digest.update(&buf[..count]);
-        Ok(count)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.inner.flush()
-    }
-}
-
-impl BufferedFileWriter {}
-
-impl Drop for BufferedFileWriter {
-    fn drop(&mut self) {
-        // SAFETY: this is the only instance where the digest is removed so it is still valid.
-        // this is drop so it can't be called more than once.
-        let digest = unsafe { ManuallyDrop::take(&mut self.digest) };
-        let checksum = digest.finalize();
-        self.inner.write_all(&checksum.to_le_bytes());
-    }
-}
+mod writer;
 
 impl BufferedFile {
     pub fn new(path: std::path::PathBuf) -> Result<Self, BufferedFileErrors> {
@@ -147,7 +122,7 @@ impl BufferedFile {
         })
     }
 
-    pub fn write(self) -> Result<BufferedFileWriter, BufferedFileErrors> {
+    pub fn write(self) -> Result<BufferedFileWriter<std::fs::File>, BufferedFileErrors> {
         let files = Self::find_files(&self.file)?;
 
         let mut files_with_generation: Vec<_> = files
@@ -176,7 +151,6 @@ impl BufferedFile {
             }
         });
 
-        let digest = CRC.digest();
         let target_file = match files_with_generation.first() {
             Some(target_file) => {
                 let mut target_file = OpenOptions::new()
@@ -199,10 +173,7 @@ impl BufferedFile {
                 target_file
             }
         };
-        Ok(BufferedFileWriter {
-            inner: target_file,
-            digest,
-        })
+        Ok(BufferedFileWriter::new(target_file))
     }
 
     fn select_file(

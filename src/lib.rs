@@ -1,19 +1,35 @@
 use std::{
     cmp::Ordering,
     fs::OpenOptions,
-    io::{Read, Seek, SeekFrom, Write},
+    io::{ErrorKind, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
+    thread::current,
 };
 
 use crc::{Crc, CRC_32_ISCSI};
 use thiserror::Error;
 
 const BUFFER_COUNT: u8 = 2;
-const BUFFER_SIZE: usize = 8192;
 
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum Generation {
+    Valid(u8),
+    Invalid(u8),
+    None,
+}
+
+impl Generation {
+    pub fn is_valid(&self) -> bool {
+        match self {
+            Generation::Valid(_) => true,
+            _ => false,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
 pub struct BufferedFile {
-    file: std::path::PathBuf,
-    current_generation: u8,
+    files: Vec<(std::path::PathBuf, Generation)>,
 }
 
 #[derive(Error, Debug)]
@@ -25,7 +41,7 @@ pub enum BufferedFileErrors {
 }
 
 enum FileCheckResult {
-    Good { generation: u8 },
+    Good { generation: Generation },
     ChecksumFailure,
 }
 const CRC: crc::Crc<u32> = Crc::<u32>::new(&CRC_32_ISCSI);
@@ -33,7 +49,7 @@ const CRC: crc::Crc<u32> = Crc::<u32>::new(&CRC_32_ISCSI);
 fn check_file(file: &Path) -> std::io::Result<FileCheckResult> {
     let mut file = std::fs::File::open(file)?;
     let mut digest = CRC.digest();
-    let mut buf = [0u8; BUFFER_SIZE];
+    let mut buf = [0u8; 8192];
     let mut valid = file.read(&mut buf)?;
     let read = &buf[..valid];
     let generation = read[0];
@@ -49,7 +65,9 @@ fn check_file(file: &Path) -> std::io::Result<FileCheckResult> {
             0 => {
                 // File is finished
                 return Ok(if digest.finalize() == potential_expected_crc32 {
-                    FileCheckResult::Good { generation }
+                    FileCheckResult::Good {
+                        generation: Generation::Valid(generation),
+                    }
                 } else {
                     FileCheckResult::ChecksumFailure
                 });
@@ -83,94 +101,73 @@ mod writer;
 impl BufferedFile {
     pub fn new(path: std::path::PathBuf) -> Result<Self, BufferedFileErrors> {
         let files = Self::find_files(&path)?;
-        Self::select_file(files.into_iter())
+        let files = files
+            .into_iter()
+            .flat_map(|f| match check_file(&f) {
+                Ok(FileCheckResult::Good { generation }) => Ok((f, generation)),
+                Ok(FileCheckResult::ChecksumFailure) => Ok((f, Generation::None)),
+                Err(err) => match err.kind() {
+                    ErrorKind::NotFound => Ok((f, Generation::None)),
+                    _ => Err(err),
+                },
+            })
+            .collect::<Vec<_>>();
+
+        Ok(BufferedFile { files })
+    }
+
+    fn select_newest_valid(&self) -> Result<&Path, BufferedFileErrors> {
+        let file = self
+            .files
+            .iter()
+            .filter(|(_, gen)| gen.is_valid())
+            .max_by_key(|(_, gen)| match gen {
+                Generation::Valid(val) => *val,
+                _ => 0,
+            });
+
+        match file {
+            Some((file, _)) => Ok(file),
+            None => Err(BufferedFileErrors::AllFilesInvalidError),
+        }
     }
 
     pub fn read(self) -> Result<BufferedFileReader<std::fs::File>, BufferedFileErrors> {
-        let mut file = OpenOptions::new().read(true).open(self.file)?;
+        let file = self.select_newest_valid()?;
+        let mut file = OpenOptions::new().read(true).open(file)?;
         file.seek(SeekFrom::Start(1))?;
         let usable_file_size = file.metadata()?.len().saturating_sub(4);
         Ok(BufferedFileReader::new(file, usable_file_size))
     }
 
     pub fn write(self) -> Result<BufferedFileWriter<std::fs::File>, BufferedFileErrors> {
-        let files = Self::find_files(&self.file)?;
-
-        let mut files_with_generation: Vec<_> = files
+        let file = self
+            .files
             .iter()
-            .flat_map(|path| {
-                let file = OpenOptions::new().read(true).open(path);
-                match file {
-                    Ok(file) => Ok((path, file.bytes().next())),
-                    Err(x) => Err(BufferedFileErrors::from(x)),
-                }
+            .min_by_key(|(_, gen)| match gen {
+                Generation::Valid(val) => *val,
+                _ => 0u8,
             })
-            .collect();
+            .expect("Files should contain at least one value");
 
-        files_with_generation.sort_unstable_by(|a, b| {
-            let a = &a.1;
-            let b = &b.1;
+        let current_generation = self
+            .files
+            .iter()
+            .map(|(_, gen)| match gen {
+                Generation::Valid(val) => *val,
+                _ => 0u8,
+            })
+            .max()
+            .expect("Files should contain at least one value");
 
-            match (a, b) {
-                (Some(Ok(a)), Some(Ok(b))) => wrapping_cmp(*a, *b),
-                (None, None) => Ordering::Equal,
-                (_, Some(Ok(_))) => Ordering::Less,
-                (Some(Ok(_)), _) => Ordering::Greater,
-                (None, Some(Err(_))) => Ordering::Equal,
-                (Some(Err(_)), Some(Err(_))) => Ordering::Equal,
-                (Some(Err(_)), None) => Ordering::Equal,
-            }
-        });
+        let mut target_file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&file.0)?;
+        target_file.write_all(&[current_generation.wrapping_add(1)])?;
 
-        let target_file = match files_with_generation.first() {
-            Some(target_file) => {
-                let mut target_file = OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .truncate(true)
-                    .open(target_file.0)?;
-                target_file.write_all(&[self.current_generation.wrapping_add(1)])?;
-                target_file
-            }
-            None => {
-                let mut default_file_path = self.file;
-                default_file_path.push(".1");
-                let mut target_file = OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .truncate(true)
-                    .open(default_file_path)?;
-                target_file.write_all(&[1])?;
-                target_file
-            }
-        };
         Ok(BufferedFileWriter::new(target_file))
-    }
-
-    fn select_file(
-        files: impl Iterator<Item = PathBuf>,
-    ) -> std::result::Result<BufferedFile, BufferedFileErrors> {
-        let mut valid_files = Vec::with_capacity(BUFFER_COUNT.into());
-        for file in files {
-            match check_file(file.as_path())? {
-                FileCheckResult::ChecksumFailure => {
-                    continue;
-                }
-                FileCheckResult::Good { generation } => {
-                    valid_files.push((file, generation));
-                }
-            }
-        }
-
-        valid_files.sort_by_cached_key(|(_file, generation)| *generation);
-
-        match valid_files.into_iter().next() {
-            Some((file, current_generation)) => Ok(Self {
-                file,
-                current_generation,
-            }),
-            None => Err(BufferedFileErrors::AllFilesInvalidError),
-        }
     }
 
     fn find_files(path: &std::path::Path) -> std::io::Result<Vec<PathBuf>> {
@@ -178,20 +175,17 @@ impl BufferedFile {
             .file_name()
             .expect("provided path should be a valid file path");
         let ancestor = path
-            .ancestors()
-            .next()
+            .parent()
             .expect("provided path should be a valid file path");
 
         let mut result = Vec::with_capacity(BUFFER_COUNT.into());
-        for i in 1..BUFFER_COUNT {
+        for i in 1..=BUFFER_COUNT {
             let mut file = ancestor.to_path_buf();
             let mut file_name = stem.to_os_string();
             file_name.push(format!(".{i}"));
             file.push(file_name);
 
-            if file.exists() {
-                result.push(file);
-            }
+            result.push(file);
         }
         Ok(result)
     }
@@ -207,9 +201,89 @@ fn wrapping_cmp(a: u8, b: u8) -> Ordering {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+
+    use crate::{tests::utils::TempDir, BufferedFile, BufferedFileErrors};
+
     #[test]
-    fn it_works() {
-        let result = 2 + 2;
-        assert_eq!(result, 4);
+    fn new_file_gives_error_on_read() {
+        let dir = TempDir::new();
+        let file = dir.path().join("data-file.txt");
+        let managed_file = BufferedFile::new(file)
+            .expect("It should be possible to create for not yet existing files.");
+
+        let reader = managed_file.read();
+        assert!(
+            matches!(reader, Err(BufferedFileErrors::AllFilesInvalidError)),
+            "Reader is a {reader:?}. Expected an Err(BufferedFileErrors::AllFilesInvalidError)"
+        );
+    }
+
+    #[test]
+    fn can_write_new_file() {
+        let dir = TempDir::new();
+        let file = dir.path().join("data-file.txt");
+        let managed_file = BufferedFile::new(file)
+            .expect("It should be possible to create for not yet existing files.");
+
+        let mut writer = managed_file
+            .write()
+            .expect("A new file should be writeable");
+
+        writer
+            .write_all(b"Hello World")
+            .expect("Can not write into the file");
+
+        drop(writer);
+
+        let expected_file = dir.path().join("data-file.txt.1");
+        assert!(expected_file.exists());
+    }
+
+    mod utils {
+        use std::{
+            env, fs,
+            path::{Path, PathBuf},
+        };
+
+        #[derive(Debug)]
+        pub struct TempDir(PathBuf);
+
+        impl Drop for TempDir {
+            fn drop(&mut self) {
+                fs::remove_dir_all(&self.0).unwrap();
+            }
+        }
+
+        impl TempDir {
+            /// Create a new empty temporary directory under the system's configured
+            /// temporary directory.
+            pub fn new() -> TempDir {
+                use std::sync::atomic::{AtomicUsize, Ordering};
+
+                static TRIES: usize = 100;
+                #[allow(deprecated)]
+                static COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+                let tmpdir = env::temp_dir();
+                for _ in 0..TRIES {
+                    let count = COUNTER.fetch_add(1, Ordering::SeqCst);
+                    let path = tmpdir.join("rust-walkdir").join(count.to_string());
+                    if path.is_dir() {
+                        continue;
+                    }
+                    fs::create_dir_all(&path)
+                        .map_err(|e| panic!("failed to create {}: {}", path.display(), e))
+                        .unwrap();
+                    return TempDir(path);
+                }
+                panic!("failed to create temp dir after {} tries", TRIES)
+            }
+
+            /// Return the underlying path to this temporary directory.
+            pub fn path(&self) -> &Path {
+                &self.0
+            }
+        }
     }
 }

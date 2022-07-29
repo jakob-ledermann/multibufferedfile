@@ -1,5 +1,6 @@
 use std::io::{Read, Seek, SeekFrom};
 
+#[derive(Debug)]
 pub struct BufferedFileReader<T>
 where
     T: Read,

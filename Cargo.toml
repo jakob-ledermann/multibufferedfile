@@ -10,6 +10,7 @@ crc = "3.0.0"
 thiserror = "1.0.31"
 
 [lib]
+crate-type = ["lib", "cdylib", "staticlib"]
 
 [[bin]]
 name = "cli"

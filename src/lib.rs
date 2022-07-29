@@ -41,6 +41,16 @@ enum FileCheckResult {
 }
 const CRC: crc::Crc<u32> = Crc::<u32>::new(&CRC_32_BZIP2);
 
+pub use reader::*;
+
+mod reader;
+
+pub use writer::*;
+
+mod writer;
+
+mod ffi;
+
 fn check_file(file: &Path) -> std::io::Result<FileCheckResult> {
     let mut file = std::fs::File::open(file)?;
     let mut digest = CRC.digest();
@@ -88,26 +98,16 @@ fn check_file(file: &Path) -> std::io::Result<FileCheckResult> {
     }
 }
 
-pub use reader::*;
-
-mod reader;
-
-pub use writer::*;
-
-mod writer;
-
 impl BufferedFile {
     pub fn new(path: std::path::PathBuf) -> Result<Self, BufferedFileErrors> {
-        let files = Self::find_files(&path)?;
+        let files = Self::find_files(&path);
         let files = files
             .into_iter()
             .flat_map(|f| match check_file(&f) {
                 Ok(FileCheckResult::Good { generation }) => Ok((f, generation)),
                 Ok(FileCheckResult::ChecksumFailure) => Ok((f, Generation::None)),
-                Err(err) => match err.kind() {
-                    ErrorKind::NotFound => Ok((f, Generation::None)),
-                    _ => Err(err),
-                },
+                Err(err) if err.kind() == ErrorKind::NotFound => Ok((f, Generation::None)),
+                Err(err) => Err(err),
             })
             .collect::<Vec<_>>();
 
@@ -170,7 +170,7 @@ impl BufferedFile {
         Ok(BufferedFileWriter::new(target_file))
     }
 
-    fn find_files(path: &std::path::Path) -> std::io::Result<Vec<PathBuf>> {
+    fn find_files(path: &std::path::Path) -> Vec<PathBuf> {
         let stem = path
             .file_name()
             .expect("provided path should be a valid file path");
@@ -187,7 +187,7 @@ impl BufferedFile {
 
             result.push(file);
         }
-        Ok(result)
+        result
     }
 }
 
@@ -298,6 +298,43 @@ mod tests {
             );
             assert_eq!(&contents.as_slice()[1..], b"Hello World\xDA\x89\x5C\x06")
         }
+    }
+
+    #[test]
+    fn can_write_empty_file() {
+        let dir = TempDir::new();
+        let file = dir.path().join("data-file.txt");
+
+        let managed_file = BufferedFile::new(file.clone())
+            .expect("It should be possible to create for not yet existing files.");
+
+        let mut writer = managed_file
+            .write()
+            .expect("A new file should be writeable");
+
+        writer.write_all(b"").expect("Can not write into the file");
+
+        drop(writer);
+
+        let expected_generation = 1;
+        let file_number = 1;
+        let expected_file = dir.path().join(format!("data-file.txt.{file_number}"));
+        assert!(
+            expected_file.exists(),
+            "The file {expected_file:?} does not exist"
+        );
+
+        let mut contents = Vec::new();
+        let mut file = std::fs::File::open(expected_file).expect("Could not open File");
+        file.read_to_end(&mut contents)
+            .expect("Could not verify written file");
+
+        assert_eq!(
+            contents.as_slice()[0],
+            expected_generation,
+            "Expected generation {expected_generation}"
+        );
+        assert_eq!(&contents.as_slice()[1..], b"Hello World\xDA\x89\x5C\x06")
     }
 
     mod utils {

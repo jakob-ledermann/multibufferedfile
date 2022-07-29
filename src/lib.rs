@@ -3,10 +3,9 @@ use std::{
     fs::OpenOptions,
     io::{ErrorKind, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    thread::current,
 };
 
-use crc::{Crc, CRC_32_ISCSI};
+use crc::{Crc, CRC_32_BZIP2};
 use thiserror::Error;
 
 const BUFFER_COUNT: u8 = 2;
@@ -14,16 +13,12 @@ const BUFFER_COUNT: u8 = 2;
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 enum Generation {
     Valid(u8),
-    Invalid(u8),
     None,
 }
 
 impl Generation {
     pub fn is_valid(&self) -> bool {
-        match self {
-            Generation::Valid(_) => true,
-            _ => false,
-        }
+        matches!(self, Generation::Valid(_))
     }
 }
 
@@ -44,16 +39,19 @@ enum FileCheckResult {
     Good { generation: Generation },
     ChecksumFailure,
 }
-const CRC: crc::Crc<u32> = Crc::<u32>::new(&CRC_32_ISCSI);
+const CRC: crc::Crc<u32> = Crc::<u32>::new(&CRC_32_BZIP2);
 
 fn check_file(file: &Path) -> std::io::Result<FileCheckResult> {
     let mut file = std::fs::File::open(file)?;
     let mut digest = CRC.digest();
     let mut buf = [0u8; 8192];
     let mut valid = file.read(&mut buf)?;
+    if valid < 5 {
+        return Ok(FileCheckResult::ChecksumFailure);
+    }
     let read = &buf[..valid];
     let generation = read[0];
-    digest.update(&read[1..read.len() - 4]);
+    digest.update(&read[1..read.len().saturating_sub(4)]);
     let mut potential_expected_crc32: u32 = u32::from_le_bytes(
         read[read.len() - 4..]
             .try_into()
@@ -136,7 +134,7 @@ impl BufferedFile {
         let file = self.select_newest_valid()?;
         let mut file = OpenOptions::new().read(true).open(file)?;
         file.seek(SeekFrom::Start(1))?;
-        let usable_file_size = file.metadata()?.len().saturating_sub(4);
+        let usable_file_size = file.metadata()?.len().saturating_sub(5);
         Ok(BufferedFileReader::new(file, usable_file_size))
     }
 
@@ -144,9 +142,11 @@ impl BufferedFile {
         let file = self
             .files
             .iter()
-            .min_by_key(|(_, gen)| match gen {
-                Generation::Valid(val) => *val,
-                _ => 0u8,
+            .min_by(|(_, a), (_, b)| match (a, b) {
+                (Generation::Valid(a), Generation::Valid(b)) => wrapping_cmp(*a, *b),
+                (Generation::None, Generation::None) => Ordering::Equal,
+                (Generation::None, _) => Ordering::Less,
+                (_, Generation::None) => Ordering::Greater,
             })
             .expect("Files should contain at least one value");
 
@@ -157,7 +157,7 @@ impl BufferedFile {
                 Generation::Valid(val) => *val,
                 _ => 0u8,
             })
-            .max()
+            .max_by(|&a, &b| wrapping_cmp(a, b))
             .expect("Files should contain at least one value");
 
         let mut target_file = OpenOptions::new()
@@ -194,14 +194,27 @@ impl BufferedFile {
 fn wrapping_cmp(a: u8, b: u8) -> Ordering {
     match a.wrapping_sub(b) {
         0 => Ordering::Equal,
-        x if x < 128 => Ordering::Less,
-        _ => Ordering::Greater,
+        x if x < 128 => Ordering::Greater,
+        _ => Ordering::Less,
     }
+}
+
+#[test]
+fn wrapping_cmp_test() {
+    assert_eq!(wrapping_cmp(0, 0), Ordering::Equal);
+    assert_eq!(wrapping_cmp(1, 1), Ordering::Equal);
+    assert_eq!(wrapping_cmp(0, 1), Ordering::Less);
+    assert_eq!(wrapping_cmp(1, 0), Ordering::Greater);
+    assert_eq!(wrapping_cmp(255, 0), Ordering::Less);
+    assert_eq!(wrapping_cmp(0, 255), Ordering::Greater);
 }
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write;
+    use std::{
+        io::{Read, Write},
+        ops::BitAnd,
+    };
 
     use crate::{tests::utils::TempDir, BufferedFile, BufferedFileErrors};
 
@@ -220,24 +233,71 @@ mod tests {
     }
 
     #[test]
+    fn can_read_a_written_file() {
+        let dir = TempDir::new();
+        let file = dir.path().join("data-file.txt");
+
+        let managed_file = BufferedFile::new(file.clone())
+            .expect("It should be possible to create for not yet existing files.");
+        let mut writer = managed_file.write().expect("Can not write the file");
+        writer
+            .write_all(b"Hello World")
+            .expect("Should be able to write");
+        drop(writer);
+
+        let mut reader = BufferedFile::new(file)
+            .expect("Can not find files")
+            .read()
+            .expect("Can not read the file");
+
+        let mut contents = Vec::new();
+        reader
+            .read_to_end(&mut contents)
+            .expect("Error reading from file");
+
+        assert_eq!(contents.as_slice(), b"Hello World")
+    }
+
+    #[test]
     fn can_write_new_file() {
         let dir = TempDir::new();
         let file = dir.path().join("data-file.txt");
-        let managed_file = BufferedFile::new(file)
-            .expect("It should be possible to create for not yet existing files.");
 
-        let mut writer = managed_file
-            .write()
-            .expect("A new file should be writeable");
+        let mut expected_generation: u8 = 0;
+        for i in 1..300 {
+            let managed_file = BufferedFile::new(file.clone())
+                .expect("It should be possible to create for not yet existing files.");
 
-        writer
-            .write_all(b"Hello World")
-            .expect("Can not write into the file");
+            let mut writer = managed_file
+                .write()
+                .expect("A new file should be writeable");
 
-        drop(writer);
+            writer
+                .write_all(b"Hello World")
+                .expect("Can not write into the file");
 
-        let expected_file = dir.path().join("data-file.txt.1");
-        assert!(expected_file.exists());
+            drop(writer);
+
+            expected_generation = expected_generation.wrapping_add(1u8);
+            let file_number = if i.bitand(1) > 0 { 1 } else { 2 };
+            let expected_file = dir.path().join(format!("data-file.txt.{file_number}"));
+            assert!(
+                expected_file.exists(),
+                "The file {expected_file:?} does not exist"
+            );
+
+            let mut contents = Vec::new();
+            let mut file = std::fs::File::open(expected_file).expect("Could not open File");
+            file.read_to_end(&mut contents)
+                .expect("Could not verify written file");
+
+            assert_eq!(
+                contents.as_slice()[0],
+                expected_generation,
+                "Expected generation {expected_generation} in run {i}"
+            );
+            assert_eq!(&contents.as_slice()[1..], b"Hello World\xDA\x89\x5C\x06")
+        }
     }
 
     mod utils {

@@ -334,7 +334,7 @@ mod tests {
             expected_generation,
             "Expected generation {expected_generation}"
         );
-        assert_eq!(&contents.as_slice()[1..], b"Hello World\xDA\x89\x5C\x06")
+        assert_eq!(&contents.as_slice()[1..], b"\x00\x00\x00\x00")
     }
 
     mod utils {

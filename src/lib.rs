@@ -8,29 +8,39 @@ use std::{
 use crc::{Crc, CRC_32_BZIP2};
 use thiserror::Error;
 
+/// The number of parallel buffers, that exist at one point in time.
 const BUFFER_COUNT: u8 = 2;
 
+/// Describes the Generation of a stored file
+///
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 enum Generation {
+    /// The generation of a valid file with the value of the generation
     Valid(u8),
+    /// Marker for files which are either invalid or do not yet exist
     None,
 }
 
 impl Generation {
+    /// Checks if the generation is valid
     pub fn is_valid(&self) -> bool {
         matches!(self, Generation::Valid(_))
     }
 }
 
+/// A double buffered File is represented here. It can be opened for either read or write access.
 #[derive(Debug, PartialEq)]
 pub struct BufferedFile {
     files: Vec<(std::path::PathBuf, Generation)>,
 }
 
+/// The definition of Errors of this library
 #[derive(Error, Debug)]
 pub enum BufferedFileErrors {
+    /// The underlying filesystem reported an error
     #[error("Error interacting with filesystem: '{0}")]
     IoError(#[from] std::io::Error),
+    /// Either no files exist, or all existing files are invalid
     #[error("No valid file available")]
     AllFilesInvalidError,
 }
@@ -39,6 +49,8 @@ enum FileCheckResult {
     Good { generation: Generation },
     ChecksumFailure,
 }
+
+/// Stores and defines the used CRC algorithm for the checksums of the files
 const CRC: crc::Crc<u32> = Crc::<u32>::new(&CRC_32_BZIP2);
 
 pub use reader::*;
@@ -99,8 +111,22 @@ fn check_file(file: &Path) -> std::io::Result<FileCheckResult> {
 }
 
 impl BufferedFile {
-    pub fn new(path: std::path::PathBuf) -> Result<Self, BufferedFileErrors> {
-        let files = Self::find_files(&path);
+    /// Creates a representation of the managed file and scans all underlying files for their validity and generation.
+    ///
+    /// # Arguments
+    /// * `path` - the path representing the desired file (this file does not exist on the filesystem)
+    ///            The backing files are stored with a suffix of .1 and .2 respectively.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use multibufferedfile::BufferedFile;
+    ///
+    /// let file = BufferedFile::new("file.txt");
+    /// assert!(file.is_ok());
+    /// ```
+    pub fn new(path: impl AsRef<Path>) -> Result<Self, BufferedFileErrors> {
+        let files = Self::find_files(path);
         let files = files
             .into_iter()
             .flat_map(|f| match check_file(&f) {
@@ -114,6 +140,7 @@ impl BufferedFile {
         Ok(BufferedFile { files })
     }
 
+    /// selects the newest valid backing file
     fn select_newest_valid(&self) -> Result<&Path, BufferedFileErrors> {
         let file = self
             .files
@@ -130,6 +157,8 @@ impl BufferedFile {
         }
     }
 
+    ///
+    /// Opens the managed file for read-only access
     pub fn read(self) -> Result<BufferedFileReader<std::fs::File>, BufferedFileErrors> {
         let file = self.select_newest_valid()?;
         let mut file = OpenOptions::new().read(true).open(file)?;
@@ -138,6 +167,9 @@ impl BufferedFile {
         Ok(BufferedFileReader::new(file, usable_file_size))
     }
 
+    ///
+    /// Opens the managed file for write access
+    ///
     pub fn write(self) -> Result<BufferedFileWriter<std::fs::File>, BufferedFileErrors> {
         let file = self
             .files
@@ -170,11 +202,13 @@ impl BufferedFile {
         Ok(BufferedFileWriter::new(target_file))
     }
 
-    fn find_files(path: &std::path::Path) -> Vec<PathBuf> {
+    fn find_files(path: impl AsRef<Path>) -> Vec<PathBuf> {
         let stem = path
+            .as_ref()
             .file_name()
             .expect("provided path should be a valid file path");
         let ancestor = path
+            .as_ref()
             .parent()
             .expect("provided path should be a valid file path");
 
@@ -191,6 +225,8 @@ impl BufferedFile {
     }
 }
 
+///
+/// helps comparing the generations with wrapping behaviour (assumes increments of 1)
 fn wrapping_cmp(a: u8, b: u8) -> Ordering {
     match a.wrapping_sub(b) {
         0 => Ordering::Equal,
@@ -199,6 +235,7 @@ fn wrapping_cmp(a: u8, b: u8) -> Ordering {
     }
 }
 
+/// Provides tests for the helper function `wrapping_cmp`
 #[test]
 fn wrapping_cmp_test() {
     assert_eq!(wrapping_cmp(0, 0), Ordering::Equal);
@@ -222,7 +259,7 @@ mod tests {
     fn new_file_gives_error_on_read() {
         let dir = TempDir::new();
         let file = dir.path().join("data-file.txt");
-        let managed_file = BufferedFile::new(file)
+        let managed_file = BufferedFile::new(&file)
             .expect("It should be possible to create for not yet existing files.");
 
         let reader = managed_file.read();
@@ -237,7 +274,7 @@ mod tests {
         let dir = TempDir::new();
         let file = dir.path().join("data-file.txt");
 
-        let managed_file = BufferedFile::new(file.clone())
+        let managed_file = BufferedFile::new(&file)
             .expect("It should be possible to create for not yet existing files.");
         let mut writer = managed_file.write().expect("Can not write the file");
         writer
@@ -245,7 +282,7 @@ mod tests {
             .expect("Should be able to write");
         drop(writer);
 
-        let mut reader = BufferedFile::new(file)
+        let mut reader = BufferedFile::new(&file)
             .expect("Can not find files")
             .read()
             .expect("Can not read the file");
@@ -265,7 +302,7 @@ mod tests {
 
         let mut expected_generation: u8 = 0;
         for i in 1..300 {
-            let managed_file = BufferedFile::new(file.clone())
+            let managed_file = BufferedFile::new(&file)
                 .expect("It should be possible to create for not yet existing files.");
 
             let mut writer = managed_file
@@ -305,7 +342,7 @@ mod tests {
         let dir = TempDir::new();
         let file = dir.path().join("data-file.txt");
 
-        let managed_file = BufferedFile::new(file.clone())
+        let managed_file = BufferedFile::new(&file)
             .expect("It should be possible to create for not yet existing files.");
 
         let mut writer = managed_file

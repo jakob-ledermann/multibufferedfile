@@ -2,6 +2,10 @@ use std::{io::Write, mem::ManuallyDrop};
 
 use crc::Digest;
 
+///
+/// Represents write access to the file.
+/// Generates the checksum of the file while writing the contents.
+/// 
 pub struct BufferedFileWriter<T: Write> {
     inner: T,
     digest: ManuallyDrop<Digest<'static, u32>>,

@@ -8,6 +8,7 @@ edition = "2021"
 [dependencies]
 crc = "3.0.0"
 thiserror = "1.0.31"
+tracing = "0.1.36"
 
 [lib]
 crate-type = ["lib", "cdylib", "staticlib"]

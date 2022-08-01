@@ -1,5 +1,9 @@
 use std::io::{Read, Seek, SeekFrom};
 
+///
+/// Represents the read-only access to the file.
+/// Validation has been performed on open. This provides an `impl std::io::Read` to the contents of the file.
+/// 
 #[derive(Debug)]
 pub struct BufferedFileReader<T>
 where

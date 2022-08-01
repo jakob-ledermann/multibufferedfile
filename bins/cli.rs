@@ -19,7 +19,7 @@ pub fn main() {
             .expect("The second argument should be a file path"),
     );
 
-    let buffered = BufferedFile::new(file).expect("Cloud not create file wrapper.");
+    let buffered = BufferedFile::new(&file).expect("Cloud not create file wrapper.");
     match verb.to_ascii_lowercase().as_str() {
         "read" => {
             let reader = buffered.read().expect("Could not create Reader");

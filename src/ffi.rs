@@ -49,6 +49,22 @@ impl From<&std::io::Error> for ErrorCode {
     }
 }
 
+///
+/// Opens the latest valid version of the specified file for readonly access.
+///
+/// # params
+/// `path` - The specified file path. this path is suffixed by .1 or .2 before actually querying the file system.
+///          So if you obtain the path by file system enumeration you should strip the suffix before calling this function.
+///
+/// # remarks
+/// The file will be buffered on disk, is always the newest valid version of the file.
+///
+/// # Returnvalue
+/// this function returns a pointer to a `FileReader` struct in memory. This pointer must be used to read data from the file and is not a file descriptor.
+/// After all data is read from the file this pointer must be handed to the function `bufferedfile_close_read` for cleanup.
+/// In case of an error this function returns a null pointer.
+/// You should use `last_error_length` and `last_error_message` to obtain the detailed error description.
+///
 #[no_mangle]
 pub extern "C" fn bufferedfile_open_read(path: *const c_char) -> FileReader {
     let path = unsafe { CStr::from_ptr(path) };
@@ -84,6 +100,22 @@ pub extern "C" fn bufferedfile_open_read(path: *const c_char) -> FileReader {
     }
 }
 
+///
+/// Opens the specified file for write access.
+///
+/// # params
+/// `path` - The specified file path. this path is suffixed by .1 or .2 before actually querying the file system.
+///          So if you obtain the path by file system enumeration you should strip the suffix before calling this function.
+///
+/// # remarks
+/// The file will be buffered on disk, so the opened file will either be the invalid file or the oldest valid file.
+///
+/// # Returnvalue
+/// this function returns a pointer to a FileWriter struct in memory. This pointer must be used to write data to the file and is no file descriptor.
+/// After all data is written this pointer must be handed to the function `bufferedfile_close_write`.
+/// In case of an error this function returns a null pointer.
+/// You should use `last_error_length` and `last_error_message` to obtain the detailed error description.
+///
 #[no_mangle]
 pub extern "C" fn bufferedfile_open_write(path: *const c_char) -> FileWriter {
     let path = unsafe { CStr::from_ptr(path) };
@@ -119,6 +151,20 @@ pub extern "C" fn bufferedfile_open_write(path: *const c_char) -> FileWriter {
     }
 }
 
+///
+/// Reades data from the file into the buffer.
+///
+/// # Params
+/// `reader` - the pointer to a `FileReader` obtained from `bufferedfile_open_read`.
+/// `buffer` - a pointer to a byte array for the data to read into.
+/// `buffer_len` - the number of bytes allocated in `buffer` that should be read from the file.
+///                This value must be smaller than i64::MAX as that is the maximum number of bytes the function can report.
+///
+/// # Returnvalue
+///
+/// In the success case the return value is the number of bytes read.
+/// In case an error occures the return value is a negative number and you should use `last_error_length` and `last_error_message` to obtain the detailed error description.
+///
 #[no_mangle]
 pub extern "C" fn bufferedfile_read(reader: FileReader, buffer: *mut u8, buffer_len: usize) -> i64 {
     if buffer_len > usize::try_from(i64::MAX).unwrap_or(buffer_len) {
@@ -150,6 +196,19 @@ pub extern "C" fn bufferedfile_read(reader: FileReader, buffer: *mut u8, buffer_
     }
 }
 
+///
+/// Writes the buffer into the file.
+///
+/// # Params
+/// `writer` - the pointer to a `FileWriter` obtained from `bufferedfile_open_write`.
+/// `buffer` - a pointer to a byte array for the data to write to the file.
+/// `buffer_len` - the number of bytes allocated in `buffer` that should be written to the file.
+///                This value must be smaller than i64::MAX as that is the maximum number of bytes the function can report.
+///
+/// # Return value
+/// In the success case the return value is the number of bytes written.
+/// In case an error occures the return value is a negative Number and you should use `last_error_length` and `last_error_message` to obtain the detailed error description.
+///
 #[no_mangle]
 pub extern "C" fn bufferedfile_write(
     writer: FileWriter,
@@ -185,6 +244,16 @@ pub extern "C" fn bufferedfile_write(
     }
 }
 
+///
+/// Close the file opened for reading.
+///
+/// # Params
+/// `reader` - the pointer to a `FileReader` obtained from `bufferedfile_open_read`.
+///
+/// # Remarks
+/// The reader must not be used after calling this funtion.
+/// The pointer is invalidated here and a use after calling this method is a use after free bug.
+///
 #[no_mangle]
 pub extern "C" fn bufferedfile_close_read(reader: FileReader) {
     if !reader.is_null() {
@@ -193,6 +262,16 @@ pub extern "C" fn bufferedfile_close_read(reader: FileReader) {
     }
 }
 
+///
+/// Close the file opened for writing.
+///
+/// # Params
+/// `writer` - the pointer to a `FileReader` obtained from `bufferedfile_open_read`.
+///
+/// # Remarks
+/// The writer must not be used after calling this method.
+/// The pointer is invalidated here and a use after calling this method is a use after free bug.
+///
 #[no_mangle]
 pub extern "C" fn bufferedfile_close_write(writer: FileWriter) {
     if !writer.is_null() {

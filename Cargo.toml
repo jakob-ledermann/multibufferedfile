@@ -2,13 +2,16 @@
 name = "multibufferedfile"
 version = "0.1.0"
 edition = "2021"
-
+build = "build.rs"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
 crc = "3.0.0"
 thiserror = "1.0.31"
 tracing = "0.1.36"
+
+[build-dependencies]
+cbindgen = "0.24.3"
 
 [lib]
 crate-type = ["lib", "cdylib", "staticlib"]
